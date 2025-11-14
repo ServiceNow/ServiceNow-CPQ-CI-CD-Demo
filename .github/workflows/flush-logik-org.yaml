@@ -1,0 +1,132 @@
+name: Flush Logik Org
+
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        description: 'Base URL of your Logik org (e.g. https://ci-cd-staging.demo01.logik.io)'
+        required: true
+        type: string
+    secrets:
+      api_key:
+        description: 'Admin API key for your Logik org'
+        required: true
+
+jobs:
+  flush:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Flush all Blueprints, Rules & Fields
+        env:
+          BASE_URL:   ${{ inputs.api_url }}
+          AUTH_TOKEN: ${{ secrets.api_key }}
+        run: |
+          set -euo pipefail
+
+          # ── Normalize BASE_URL ──
+          BASE_URL="${BASE_URL%/}"
+          echo "Using BASE_URL: $BASE_URL"
+
+          # helper to treat 200 or 204 as OK
+          check_ok() {
+            local code=$1; shift
+            if [ "$code" -ne 200 ] && [ "$code" -ne 204 ]; then
+              echo "✗ Unexpected HTTP code $code for $*"
+              exit 1
+            else
+              echo "✓ $* (HTTP $code)"
+            fi
+          }
+
+          # ── 1️⃣ Blueprints (v2 fetch → v1 delete) ──
+          echo "Fetching blueprints..."
+          BLUEPRINTS=( $(
+            curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                   -H "Accept: application/json" \
+                   "$BASE_URL/api/admin/v2/blueprints?size=99999" \
+            | jq -r '.content[]?.variableName // empty'
+          ) )
+          echo "→ Found ${#BLUEPRINTS[@]} blueprints."
+
+          for bp in "${BLUEPRINTS[@]}"; do
+            echo "→ Deleting blueprint: $bp"
+            code=$(curl -s -o /tmp/bp.json -w '%{http_code}' \
+              -X DELETE \
+              -H "Authorization: Bearer $AUTH_TOKEN" \
+              "$BASE_URL/api/admin/v1/blueprints/$bp")
+            check_ok "$code" "DELETE blueprint $bp"
+          done
+
+          # ── 2️⃣ Rules (v3 fetch → v1 bulk-delete) ──
+          echo "Fetching rules..."
+          RULES=( $(
+            curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                   -H "Accept: application/json" \
+                   "$BASE_URL/api/admin/v3/rules?size=99999" \
+            | jq -r '.content[]?.variableName // empty'
+          ) )
+          echo "→ Found ${#RULES[@]} rules."
+
+          if [ "${#RULES[@]}" -gt 0 ]; then
+            printf '%s\n' "${RULES[@]}" \
+              | jq -R -s -c 'split("\n")[:-1] | map({ variableName: . })' \
+              > /tmp/rules-payload.json
+
+            echo "→ Bulk-deleting rules via v1..."
+            code=$(curl -s -o /tmp/rules.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $AUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/rules-payload.json \
+              "$BASE_URL/api/admin/v1/bulk/rules/delete")
+            check_ok "$code" "bulk DELETE rules"
+          fi
+
+          # ── 3️⃣ Fields (v3 fetch → v1 bulk-delete) ──
+          echo "Fetching fields..."
+          FIELDS=( $(
+            curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                   -H "Accept: application/json" \
+                   "$BASE_URL/api/admin/v3/fields?area=USER_ONLY&size=99999" \
+            | jq -r '.content[]?.variableName // empty'
+          ) )
+          echo "→ Found ${#FIELDS[@]} fields."
+
+          if [ "${#FIELDS[@]}" -gt 0 ]; then
+            printf '%s\n' "${FIELDS[@]}" \
+              | jq -R -s -c 'split("\n")[:-1] | map({ variableName: . })' \
+              > /tmp/fields-payload.json
+
+            echo "→ Bulk-deleting fields via v1..."
+            code=$(curl -s -o /tmp/fields.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $AUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/fields-payload.json \
+              "$BASE_URL/api/admin/v1/bulk/fields/delete")
+            check_ok "$code" "bulk DELETE fields"
+          fi
+
+          # ── 4️⃣ Final Verification ──
+          echo "Verifying cleanup..."
+          BP_LEFT=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                        -H "Accept: application/json" \
+                        "$BASE_URL/api/admin/v2/blueprints?size=1" \
+                    | jq '.content|length')
+          RL_LEFT=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                        -H "Accept: application/json" \
+                        "$BASE_URL/api/admin/v3/rules?size=1" \
+                    | jq '.content|length')
+          FL_LEFT=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+                        -H "Accept: application/json" \
+                        "$BASE_URL/api/admin/v3/fields?area=USER_ONLY&size=1" \
+                    | jq '.content|length')
+
+          echo "→ Remaining → blueprints: $BP_LEFT, rules: $RL_LEFT, fields: $FL_LEFT"
+          if [ "$BP_LEFT" -ne 0 ] || [ "$RL_LEFT" -ne 0 ] || [ "$FL_LEFT" -ne 0 ]; then
+            echo "Org not fully flushed."
+            exit 1
+          fi
+
+          echo "Logik org successfully flushed."
