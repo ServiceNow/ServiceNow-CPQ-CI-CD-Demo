@@ -1,0 +1,188 @@
+name: Logik - Pull All Blueprints, Fields, and Rules, Commit to Sandbox, and Deploy to Staging and Main
+
+on:
+  workflow_dispatch:
+
+jobs:
+  flush_staging:
+    uses: ./.github/workflows/flush-logik-org.yaml
+    with:
+      api_url: ${{ vars.LOGIK_STAGING_API_URL }}
+    secrets:
+      api_key: ${{ secrets.LOGIK_STAGING_API_KEY }}
+
+  flush_main:
+    uses: ./.github/workflows/flush-logik-org.yaml
+    with:
+      api_url: ${{ vars.LOGIK_MAIN_API_URL }}
+    secrets:
+      api_key: ${{ secrets.LOGIK_MAIN_API_KEY }}
+
+  fetch_and_commit_blueprints:
+    needs:
+      - flush_staging
+      - flush_main
+    runs-on: ubuntu-latest
+    outputs:
+      sandbox_branch: ${{ steps.set_sandbox_branch.outputs.sandbox_branch }}
+
+    steps:
+      - name: Set up Git identity
+        run: |
+          git config --global user.email "${{ vars.GIT_EMAIL }}"
+          git config --global user.name  "${{ vars.GIT_USER }}"
+
+      - name: Generate timestamp
+        id: ts
+        run: |
+          TS=$(date +'%Y%m%dT%H%M%S')
+          echo "TIMESTAMP=$TS" >> $GITHUB_ENV
+
+      - name: Checkout main (full history)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Create sandbox branch
+        id: set_sandbox_branch
+        run: |
+          SANDBOX_BRANCH="sandbox-${TIMESTAMP}"
+          echo "⇒ creating branch $SANDBOX_BRANCH from main"
+          git checkout -b "$SANDBOX_BRANCH"
+          echo "sandbox_branch=$SANDBOX_BRANCH" >> $GITHUB_OUTPUT
+          echo "SANDBOX_BRANCH=$SANDBOX_BRANCH" >> $GITHUB_ENV
+
+      - name: Install csvkit & yq
+        run: |
+          pip install csvkit
+          YQ_VERSION="v4.40.5"
+          curl -L "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+      - name: Fetch blueprint list
+        run: |
+          curl -s -H "Authorization: Bearer ${{ secrets.LOGIK_SANDBOX_API_KEY }}" \
+            "${{ vars.LOGIK_SANDBOX_API_URL }}api/admin/v2/blueprints?size=1000&sort=modified,DESC" \
+            -o blueprints.json
+
+      - name: Parse blueprint metadata
+        run: |
+          jq -r '.content[] | "\(.variableName) \(.modified) \(.lastModifiedBy)"' \
+            blueprints.json > blueprint_data.txt
+
+      - name: Export & convert all blueprints
+        run: |
+          mkdir -p blueprints
+
+          LAST_MODIFIED=""
+          LAST_USER=""
+
+          while read -r name modified user; do
+            dir="blueprints/$name"
+
+            # Remove any existing directory to avoid nested leftovers from prior runs
+            rm -rf "$dir"
+            mkdir -p "$dir"
+
+            # Track the most‐recent modified/user pair
+            if [[ -z "$LAST_MODIFIED" || "$modified" > "$LAST_MODIFIED" ]]; then
+              LAST_MODIFIED="$modified"
+              LAST_USER="$user"
+            fi
+
+            echo "→ exporting $name"
+            job=$(curl -s -w "%{http_code}" -H "Authorization: Bearer ${{ secrets.LOGIK_SANDBOX_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "[\"$name\"]" \
+              "${{ vars.LOGIK_SANDBOX_API_URL }}api/admin/v1/bulk/blueprints/export" \
+              -o /tmp/job.json)
+            code="${job: -3}"
+            [ "$code" -eq 200 ] || { echo "Export failed for $name"; exit 1; }
+            JOB_ID=$(jq -r .id /tmp/job.json)
+            sleep 30
+
+            curl -s -H "Authorization: Bearer ${{ secrets.LOGIK_SANDBOX_API_KEY }}" \
+              -o /tmp/export.zip \
+              "${{ vars.LOGIK_SANDBOX_API_URL }}api/admin/v2/bulk/export/$JOB_ID"
+
+            # Unzip directly into blueprints/<name>
+            unzip -o /tmp/export.zip -d "$dir"
+
+            # Flatten nested blueprints/<name>/… so we end up with blueprints/<name>/layouts
+            if [ -d "$dir/blueprints/$name" ]; then
+              mv "$dir/blueprints/$name"/* "$dir/"
+              rm -rf "$dir/blueprints"
+            fi
+
+            # Copy the raw zip for archival purposes
+            cp /tmp/export.zip "$dir/original_export.zip"
+
+            # Remove fields, rules, and fieldoptions.yaml so they are not tracked here
+            rm -rf "$dir/fields" "$dir/rules" "$dir/fieldoptions.yaml"
+
+            # Convert all CSVs under this directory to YAML and delete the originals
+            find "$dir" -name '*.csv' | while read -r csv; do
+              yml="${csv%.csv}.yaml"
+              csvjson "$csv" | yq -P > "$yml" && rm "$csv"
+            done
+
+            git add "$dir"
+          done < blueprint_data.txt
+
+          echo "LAST_MODIFIED=$LAST_MODIFIED" >> $GITHUB_ENV
+          echo "LAST_USER=$LAST_USER" >> $GITHUB_ENV
+
+      - name: Commit any blueprint changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "→ committing blueprint snapshot"
+            git add blueprints
+            git commit -m "Updated blueprint $TIMESTAMP - Last Modified: ${{ env.LAST_MODIFIED }} - Last Modified By: ${{ env.LAST_USER }}"
+          else
+            echo "→ no blueprint changes to commit"
+          fi
+
+      - name: Push sandbox branch
+        run: |
+          echo "→ pushing branch $SANDBOX_BRANCH"
+          git push origin HEAD:refs/heads/${SANDBOX_BRANCH}
+
+  call_rules_commit:
+    needs: fetch_and_commit_blueprints
+    uses: ./.github/workflows/pull-changed-rules.yaml
+    with:
+      api_url: ${{ vars.LOGIK_SANDBOX_API_URL }}
+    secrets:
+      api_key: ${{ secrets.LOGIK_SANDBOX_API_KEY }}
+
+  call_fields_commit:
+    needs: call_rules_commit
+    uses: ./.github/workflows/pull-changed-fields.yaml
+    with:
+      api_url: ${{ vars.LOGIK_SANDBOX_API_URL }}
+    secrets:
+      api_key: ${{ secrets.LOGIK_SANDBOX_API_KEY }}
+
+  deploy_to_staging:
+    uses: ./.github/workflows/deploy-blueprints.yaml
+    needs:
+      - call_rules_commit
+      - call_fields_commit
+    with:
+      api_url: ${{ vars.LOGIK_STAGING_API_URL }}
+      branch: staging
+    secrets:
+      api_key: ${{ secrets.LOGIK_STAGING_API_KEY }}
+
+  deploy_to_main:
+    uses: ./.github/workflows/deploy-blueprints.yaml
+    needs:
+      - call_rules_commit
+      - call_fields_commit
+      - deploy_to_staging
+    with:
+      api_url: ${{ vars.LOGIK_MAIN_API_URL }}
+      branch: main
+    secrets:
+      api_key: ${{ secrets.LOGIK_MAIN_API_KEY }}
