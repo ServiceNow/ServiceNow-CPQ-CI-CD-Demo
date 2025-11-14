@@ -1,0 +1,144 @@
+name: Deploy Blueprints to Logik Org
+
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        required: true
+        type: string
+      branch:
+        required: false
+        type: string
+        default: main
+    secrets:
+      api_key:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Git identity & branch for deployment
+        env:
+          GIT_USER:  ${{ vars.GIT_USER }}
+          GIT_EMAIL: ${{ vars.GIT_EMAIL }}
+        run: |
+          set -euo pipefail
+
+          # ─── Configure committer identity from repo vars ───
+          git config user.email "${GIT_EMAIL}"
+          git config user.name  "${GIT_USER}"
+
+          # ─── Fetch and pick branch ───
+          git fetch origin
+          BRANCH="${{ inputs.branch }}"
+          echo "→ Target deploy branch: $BRANCH"
+
+          if [ "$BRANCH" = "staging" ]; then
+            # find latest sandbox-*
+            LATEST_SANDBOX=$(
+              git for-each-ref --format='%(refname:short)' refs/remotes/origin/sandbox-* \
+                | sed 's|origin/||' \
+                | sort -r \
+                | head -n1
+            )
+            if [ -z "$LATEST_SANDBOX" ]; then
+              echo "✗ No sandbox-* branches found to promote."
+              exit 1
+            fi
+
+            echo "→ Creating/updating staging from $LATEST_SANDBOX"
+            git checkout -B staging "origin/$LATEST_SANDBOX"
+            git push origin staging --force
+
+          elif [ "$BRANCH" = "main" ]; then
+            echo "→ Checking out main and merging staging into main"
+            git checkout main
+            git pull origin main
+            git merge origin/staging --no-ff -m "Promote staging to main"
+            git push origin main
+
+          else
+            echo "→ Checking out existing branch $BRANCH"
+            git checkout "$BRANCH" \
+              && git pull origin "$BRANCH"
+          fi
+
+      - name: Deploy all blueprints to Logik org
+        env:
+          LOGIK_API_KEY: ${{ secrets.api_key }}
+          LOGIK_API_URL: ${{ inputs.api_url }}
+        run: |
+          set -euo pipefail
+
+          # ─── Normalize the LOGIK_API_URL ───
+          LOGIK_API_URL="${LOGIK_API_URL%/}"
+          echo "Using LOGIK_API_URL: $LOGIK_API_URL"
+
+          for dir in blueprints/*/; do
+            bp=$(basename "$dir")
+            zip="$dir/original_export.zip"
+            if [ ! -f "$zip" ]; then
+              echo "  ↳ skipping $bp (no zip)"
+              continue
+            fi
+
+            echo "⤷ Uploading $bp…"
+            resp=$(curl -s -w "\n%{http_code}" \
+              -F file=@"$zip" \
+              -F jobType="GENERIC_IMPORT" \
+              -H "Authorization: Bearer $LOGIK_API_KEY" \
+              "$LOGIK_API_URL/api/admin/v2/uploadFile")
+            body=$(echo "$resp" | head -n1)
+            code=$(echo "$resp" | tail -n1)
+            if [ "$code" -ne 200 ]; then
+              echo "✗ Upload failed for $bp (HTTP $code)"
+              echo "$body" | jq . || echo "$body"
+              exit 1
+            fi
+            JOB_ID=$(jq -r .id <<<"$body")
+
+            # wait for import to finish
+            for i in {1..30}; do
+              sleep 10
+              status=$(curl -s \
+                -H "Authorization: Bearer $LOGIK_API_KEY" \
+                "$LOGIK_API_URL/api/admin/v1/job/$JOB_ID" \
+                | jq -r .status)
+              echo "    • import [$i] $status"
+              [ "$status" = "COMPLETED" ] && break
+              [ "$status" = "FAILED"    ] && { echo "✗ Import failed ($bp)"; exit 1; }
+            done
+
+            echo "⤷ Triggering deploy for $bp"
+            resp=$(curl -s -w "\n%{http_code}" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $LOGIK_API_KEY" \
+              -d '{}' \
+              "$LOGIK_API_URL/api/admin/v2/blueprints/$bp/runtimes")
+            body=$(echo "$resp" | head -n1)
+            code=$(echo "$resp" | tail -n1)
+            if [ "$code" -ne 200 ] && [ "$code" -ne 201 ]; then
+              echo "✗ Deploy trigger failed for $bp (HTTP $code)"
+              exit 1
+            fi
+            DEPLOY_ID=$(jq -r .id <<<"$body")
+
+            # wait for deploy to finish
+            for i in {1..30}; do
+              sleep 10
+              st=$(curl -s \
+                -H "Authorization: Bearer $LOGIK_API_KEY" \
+                "$LOGIK_API_URL/api/admin/v1/job/$DEPLOY_ID" \
+                | jq -r .status)
+              echo "      → deploy [$i] $st"
+              [ "$st" = "COMPLETED" ] && break
+              [ "$st" = "FAILED"    ] && { echo "✗ Deployment failed ($bp)"; exit 1; }
+            done
+          done
