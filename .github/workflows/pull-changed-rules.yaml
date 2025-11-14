@@ -1,0 +1,136 @@
+name: Pull All Changed Rules to Latest Sandbox
+
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        description: "Base URL of your Logik org (e.g. https://ci-cd-staging.demo01.logik.io)"
+        required: true
+        type: string
+    secrets:
+      api_key:
+        description: "Admin API key for your Logik org"
+        required: true
+
+jobs:
+  pull_and_commit_rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Git identity
+        env:
+          GIT_EMAIL: ${{ vars.GIT_EMAIL }}
+          GIT_USER:  ${{ vars.GIT_USER }}
+        run: |
+          git config --global user.email "${GIT_EMAIL}"
+          git config --global user.name  "${GIT_USER}"
+
+      - name: Checkout all branches
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all remote branches
+        run: git fetch origin
+
+      - name: Identify latest sandbox branch and checkout
+        id: sandbox
+        run: |
+          LATEST=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/sandbox-* \
+                   | sed 's|^origin/||' \
+                   | sort -r \
+                   | head -n1)
+          echo "→ Latest sandbox branch: $LATEST"
+          echo "SANDBOX_BRANCH=$LATEST" >> $GITHUB_ENV
+          git checkout -B "$LATEST" "origin/$LATEST"
+
+      - name: Download, update, and prune rule directories
+        env:
+          API_KEY: ${{ secrets.api_key }}
+          API_URL: ${{ inputs.api_url }}
+        run: |
+          set -euo pipefail
+          API_BASE="${API_URL%/}"
+
+          # 1) Fetch the list of all rule names in one go, capture in a Bash array
+          mapfile -t CURRENT_RULES < <(
+            curl -s "${API_BASE}/api/admin/v3/rules?size=99999" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/json" \
+            | jq -r '.content[].variableName'
+          )
+
+          # 2) Make sure 'rules' directory exists
+          mkdir -p rules
+
+          # 3) For each rule returned by API, download/pretty-print and stage changes
+          LAST_MODIFIED=""
+          LAST_USER=""
+
+          for RULE_NAME in "${CURRENT_RULES[@]}"; do
+            ENCODED=$(printf '%s' "$RULE_NAME" | jq -sRr @uri)
+            DIR="rules/$RULE_NAME"
+            mkdir -p "$DIR"
+            PRETTY="$DIR/rule.json"
+
+            # Fetch the single rule JSON, capture both body and status
+            HTTP_RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/json" \
+              "${API_BASE}/api/admin/v3/rules/$ENCODED")
+            HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed -e 's/HTTPSTATUS:.*//g')
+            HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "✗ Failed to fetch $RULE_NAME (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+
+            # Pretty-print into rule.json
+            printf '%s' "$HTTP_BODY" | jq . > "$PRETTY"
+            git add "$PRETTY"
+
+            # Track latest modification timestamp/user
+            MODIFIED=$(jq -r '.modified // empty' "$PRETTY")
+            BY=$(jq -r '.lastModifiedBy // empty' "$PRETTY")
+            if [[ -z "$LAST_MODIFIED" || "$MODIFIED" > "$LAST_MODIFIED" ]]; then
+              LAST_MODIFIED="$MODIFIED"
+              LAST_USER="$BY"
+            fi
+          done
+
+          # 4) Prune any directories under 'rules/' that are NOT in CURRENT_RULES
+          existing_dirs=()
+          while IFS= read -r -d '' d; do
+            dirname="${d#rules/}"
+            existing_dirs+=( "$dirname" )
+          done < <(find rules -maxdepth 1 -mindepth 1 -type d -print0)
+
+          for OLD in "${existing_dirs[@]}"; do
+            skip_delete=false
+            for keep in "${CURRENT_RULES[@]}"; do
+              if [[ "$OLD" == "$keep" ]]; then
+                skip_delete=true
+                break
+              fi
+            done
+            if [ "$skip_delete" = false ]; then
+              echo "→ Deleting directory rules/$OLD (no longer in API response)"
+              git rm -r "rules/$OLD"
+            fi
+          done
+
+          # 5) Export environment variables for commit message
+          echo "LAST_MODIFIED=$LAST_MODIFIED" >> $GITHUB_ENV
+          echo "LAST_USER=$LAST_USER" >> $GITHUB_ENV
+
+      - name: Commit & push if changed
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No rule changes to commit."
+          else
+            echo "Changes detected; committing…"
+            git commit -m "Updated rules - Last Modified: $LAST_MODIFIED - Last Modified By: $LAST_USER"
+            git push origin "$SANDBOX_BRANCH"
+          fi
