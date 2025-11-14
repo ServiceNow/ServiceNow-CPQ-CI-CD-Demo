@@ -1,0 +1,151 @@
+name: Pull All Changed Fields to Latest Sandbox
+
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        description: 'Base URL of your Logik org (e.g. https://ci-cd-staging.demo01.logik.io)'
+        required: true
+        type: string
+    secrets:
+      api_key:
+        description: 'Admin API key for your Logik org'
+        required: true
+
+jobs:
+  pull_and_commit_fields:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Git identity
+        env:
+          GIT_EMAIL: ${{ vars.GIT_EMAIL }}
+          GIT_USER:  ${{ vars.GIT_USER }}
+        run: |
+          git config --global user.email "${GIT_EMAIL}"
+          git config --global user.name  "${GIT_USER}"
+
+      - name: Checkout all branches
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Fetch remote branches
+        run: git fetch origin
+
+      - name: Identify & checkout latest sandbox branch
+        id: sandbox
+        run: |
+          LATEST=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/sandbox-* \
+                   | sed 's|^origin/||' \
+                   | sort -r \
+                   | head -n1)
+          echo "→ Using sandbox branch: $LATEST"
+          echo "SANDBOX_BRANCH=$LATEST" >> $GITHUB_ENV
+          git checkout -B "$LATEST" "origin/$LATEST"
+
+      - name: Download, update, and prune field directories
+        env:
+          API_URL: ${{ inputs.api_url }}
+          API_KEY: ${{ secrets.api_key }}
+        run: |
+          set -euo pipefail
+          API_BASE="${API_URL%/}"
+
+          # 1) Fetch all field variableNames into a Bash array (no intermediate files)
+          mapfile -t CURRENT_FIELDS < <(
+            curl -s "${API_BASE}/api/admin/v3/fields?area=USER_ONLY&size=99999" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/json" \
+            | jq -r '.content[].variableName'
+          )
+
+          # 2) Ensure the top-level 'fields' folder exists
+          mkdir -p fields
+
+          LAST_MODIFIED=""
+          LAST_USER=""
+
+          # 3) For each field returned by the API:
+          for FIELD_NAME in "${CURRENT_FIELDS[@]}"; do
+            enc=$(printf '%s' "$FIELD_NAME" | jq -sRr @uri)
+            dir="fields/$FIELD_NAME"
+            mkdir -p "$dir"
+            pretty="$dir/field.json"
+
+            # Fetch the field definition (v2), capture both HTTP status and body
+            HTTP_RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/json" \
+              "${API_BASE}/api/admin/v2/fields/$enc")
+
+            # Separate the body and the status code
+            HTTP_BODY=$(printf '%s' "$HTTP_RESPONSE" | sed -e 's/HTTPSTATUS:.*//g')
+            HTTP_CODE=$(printf '%s' "$HTTP_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+
+            if [ "$HTTP_CODE" -ne 200 ]; then
+              echo "✗ Failed to fetch $FIELD_NAME (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+
+            # Pretty-print the JSON into field.json
+            printf '%s' "$HTTP_BODY" | jq . > "$pretty"
+            git add "$pretty"
+
+            # Track the most recent modification timestamp/user
+            mod=$(jq -r '.modified // empty' "$pretty")
+            by=$(jq -r '.lastModifiedBy // empty' "$pretty")
+            if [[ -z "$LAST_MODIFIED" || "$mod" > "$LAST_MODIFIED" ]]; then
+              LAST_MODIFIED="$mod"
+              LAST_USER="$by"
+            fi
+
+            # If this is a picklist field, fetch its options (v1) into picklist_options.json (already jqqified)
+            type=$(jq -r '.type // empty' "$pretty" | tr '[:upper:]' '[:lower:]')
+            if [ "$type" = "picklist" ]; then
+              opt="$dir/picklist_options.json"
+              curl -s \
+                -H "Authorization: Bearer $API_KEY" \
+                -H "Accept: application/json" \
+                "${API_BASE}/api/admin/v1/fields/$enc/options?size=99999" \
+                | jq . > "$opt"
+              git add "$opt"
+            fi
+          done
+
+          # 4) Prune any field directories that are no longer returned by the API
+          existing_dirs=()
+          while IFS= read -r -d '' d; do
+            dirname="${d#fields/}"
+            existing_dirs+=("$dirname")
+          done < <(find fields -maxdepth 1 -mindepth 1 -type d -print0)
+
+          for OLD in "${existing_dirs[@]}"; do
+            keep=false
+            for keep_field in "${CURRENT_FIELDS[@]}"; do
+              if [[ "$OLD" == "$keep_field" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [ "$keep" = false ]; then
+              echo "→ Deleting directory fields/$OLD (no longer in API response)"
+              git rm -r "fields/$OLD"
+            fi
+          done
+
+          # 5) Export environment vars for commit message
+          echo "LAST_MODIFIED=$LAST_MODIFIED" >> $GITHUB_ENV
+          echo "LAST_USER=$LAST_USER" >> $GITHUB_ENV
+
+      - name: Commit & push if changed
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No field changes detected."
+          else
+            echo "Field changes detected; committing…"
+            git commit -m "Updated fields - Last Modified: $LAST_MODIFIED - Last Modified By: $LAST_USER"
+            git push origin "$SANDBOX_BRANCH"
+          fi
